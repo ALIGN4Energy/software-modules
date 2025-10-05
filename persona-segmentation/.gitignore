@@ -1,0 +1,60 @@
+# R specific
+.Rhistory
+.Rapp.history
+.RData
+.Ruserdata
+*.Rproj
+.Rproj.user/
+
+# R Markdown
+*.html
+*.pdf
+*.nb.html
+
+# Temporary files
+*~
+.DS_Store
+._.DS_Store
+.Spotlight-V100
+.Trashes
+._*
+
+# Data files (large)
+cbs_postcode_data/
+*.csv
+*.xlsx
+*.xls
+
+# Model outputs
+*.rds
+predicted_personas.csv
+user_predictions_*.csv
+user_address_predictions.csv
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Docker (but keep .dockerignore in repo)
+# .dockerignore
+
+# Logs
+*.log
+
+# Output directories
+output/
+results/
+
+# Lock files
+*.lock
+
+# OS files
+Thumbs.db
+Desktop.ini

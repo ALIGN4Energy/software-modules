@@ -1,0 +1,20 @@
+[project]
+name = "profile-generator"
+version = "0.1.0"
+description = "energy consumption profile generator"
+readme = "README.md"
+authors = [
+    { name = "Nan Lin", email = "nansense97@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "matplotlib>=3.10.7",
+    "numpy>=2.3.3",
+    "pydantic>=2.12.2",
+    "pytest>=8.4.2",
+    "torch>=2.8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

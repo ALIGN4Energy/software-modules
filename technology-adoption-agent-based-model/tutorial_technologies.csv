@@ -1,0 +1,5 @@
+technology,base_cost,cost_per_kwh_unit,payback_years,co2_savings_pct,comfort_level,disruption_level,policy_support_available,co2_factor
+heat_pump,7000,600,12,0.6,2,2.0,2,0.04
+solar_pv,9000,700,15,0.7,1,1.0,2,0.02
+district_heating,4000,400,8,0.4,1,1.5,2,0.20
+hybrid_heating,5500,500,10,0.5,2,1.0,1,0.15

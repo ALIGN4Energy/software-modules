@@ -1,0 +1,549 @@
+---
+title: "REL Datasegmentation v 2"
+author: "Louison Thépaut"
+date: "2025-08-25"
+
+---
+
+```{r}
+
+rm(list = ls())
+
+## Load packages and dataset Note in this script the file paths are set up for my own laptop, you will need to update all the filepaths to point at your own repository or drive
+
+# Install required packages if not already installed
+required_packages <- c("tidyverse", "grf", "data.table", "skimr", "janitor", "missForest", "ggplot2", "pROC","purrr","dplyr","tibble", "broom", "forcats","foreign","httr","jsonlite","terra","randomForest","readxl","stringr","sf","ranger","caret")
+installed <- installed.packages()
+to_install <- setdiff(required_packages, rownames(installed))
+if (length(to_install) > 0) install.packages(to_install)
+
+# Load libraries
+library(tidyverse)
+library(grf)         # Honest causal forests
+library(data.table)  # Fast data handling
+library(skimr)       # For quick descriptive stats
+library(janitor) # Clean column names
+library(missForest) #handling NAs
+library(ggplot2)
+library(pROC)
+library(purrr)
+library(dplyr)
+library(tibble)
+library(broom)
+library(forcats)
+library(foreign)
+library(httr)
+library(jsonlite)
+library(terra)
+library(randomForest)
+library(readxl)
+library(stringr)
+library(sf)
+library(ranger)
+library(caret)
+
+
+#training data from LISS panel 
+new_vars <- fread("/Users/jeroen/Downloads/Datasegmentation for Jeroen/output.csv") %>% clean_names()
+
+df_model_unique<- read_excel("/Users/jeroen/Downloads/Datasegmentation for Jeroen/data_long_4c.xls")
+
+# Recalculate hosehold members based on partner and children
+df_model_unique <- df_model_unique %>%
+  mutate(
+    members = 1 + partner + children
+  )
+
+#  Sanity check  
+
+df_model_unique %>%
+  select(partner, children, members) %>%
+  head(10)
+
+#  Handle categorical/ordered variables
+df_model_unique <- df_model_unique %>%
+  mutate(
+    educat = factor(educat, levels = 1:6, ordered = TRUE),
+    urban = urban + 1,
+    urban = factor(urban, levels = 1:5, ordered = TRUE),
+    occupation = as.factor(occupation),
+    year_built = as.factor(year_built),
+    rental = as.factor(rental),          # just to be safe
+    partner = as.factor(partner),
+    children = as.integer(children),
+    female = as.factor(female)           # 1 = female, 0 = not
+  )
+
+# Quick check
+summary(df_model_unique$educat)
+summary(df_model_unique$urban)
+
+merged_df <- merge(df_model_unique,new_vars,by = "nomem_encr",all.x = TRUE)
+
+merged_df <- merged_df %>%
+  mutate(
+    nettohh_z = scale(nettohh)[, 1] # Convert to numeric vector from matrix
+  )
+
+#Class 1 - Financially driven (12.9%)
+#Class 2 - Policy driven (17.3%)
+#Class 3 - Erratic choosers (13.1%)
+#Class 4 - Comfort driven (56.7%)
+
+class_weights <- c(
+  Class1 = 1 / 0.129,
+  Class2 = 1 / 0.173,
+  Class3 = 1 / 0.131,
+  Class4 = 1 / 0.567
+)
+
+# Define dataset for random forest training 
+rf_training <- merged_df %>%
+  select(
+    nomem_encr,
+    class_4class,          # ✅ target
+    female,                # matched by female_share
+    age,                   # matched by avg_age
+    members,               # matched by huishoudgrootte
+    year_built,            # from LISS, matched to avg_build_year or BAG
+    rental,                # matched by rental_share
+    urban,                 # already available
+    nettohh_z,             # matched by income_z
+    square_meters          # matched by oppervlakte_m2
+  ) %>%
+  filter(!is.na(class_4class))  # drop rows with missing class label
+# Prepare data: remove ID columns and factor target
+rf_for_impute <- rf_training %>%
+  select(-nomem_encr) %>%
+  mutate(class_4class = as.factor(class_4class))
+
+# Run missForest helps flesh out any missing data 
+set.seed(123)
+rf_imputed_result <- missForest(rf_for_impute)
+
+# Extract the completed data
+rf_training_imputed <- rf_imputed_result$ximp
+
+rf_imputed_result$OOBerror
+
+```
+
+```{r}
+#Random forest training 
+# If not already done:
+rf_data <- rf_training_imputed %>%
+  mutate(class_4class = as.factor(class_4class))  # ensure factor target
+
+rf_data$class_4class <- factor(rf_data$class_4class,
+                               levels = 1:4,
+                               labels = c("Class1", "Class2", "Class3", "Class4"))
+
+# Set up 10-fold CV
+set.seed(123)
+cv_control <- trainControl(
+  method = "cv",
+  number = 10,
+  classProbs = TRUE,
+  savePredictions = "final"
+)
+# Define hyperparameter grid
+rf_grid <- expand.grid(
+  mtry = (2:8),
+  splitrule = c("gini", "extratrees"),
+  min.node.size = c(1, 3, 5, 10, 20)
+)
+# Train random forest with CV
+cv_model <- train(
+  class_4class ~ ., 
+  data = rf_data,
+  method = "ranger",
+  trControl = cv_control,
+  importance = "permutation",
+  tuneGrid = rf_grid,
+  num.trees = 1000,  # stable without overkill
+  class.weights = class_weights
+)
+
+# View performance
+print(cv_model)
+plot(cv_model)
+
+
+final_rf_model <- ranger(
+  class_4class ~ .,
+  data = rf_data,
+  importance = "permutation",
+  mtry = cv_model$bestTune$mtry,
+  splitrule = cv_model$bestTune$splitrule,
+  min.node.size = cv_model$bestTune$min.node.size,
+  num.trees = 1000,
+  seed = 123,
+  class.weights = class_weights
+)
+print(final_rf_model)
+```
+
+```{r}
+#open data prep we use 2023 as it is the most granular, once 2024 is updated you should download this and use it instead
+
+# Set the file path
+cbs_pc6_path <- "/Users/jeroen/Downloads/Datasegmentation for Jeroen/cbs_postcode_data/pc6_2023_v2.xlsx"
+# Set the file path
+cbs_pc5_path <- "/Users/jeroen/Downloads/Datasegmentation for Jeroen/cbs_postcode_data/pc5_2023_v2.xlsx"
+# Set the file path
+cbs_pc4_path <- "/Users/jeroen/Downloads/Datasegmentation for Jeroen/cbs_postcode_data/pc4_2023_v2.xlsx"
+
+# Check sheet names if needed
+excel_sheets(cbs_pc6_path)
+excel_sheets(cbs_pc5_path)
+excel_sheets(cbs_pc4_path)
+
+# Read the main sheet (usually named 'pc6_2024_v1' or similar, adjust as needed) 
+cbs_pc6 <- read_excel(cbs_pc6_path, sheet = 1, skip=8) %>%
+  clean_names() 
+cbs_pc6<-cbs_pc6[-1,-c(10:20,22,31,37:131)]
+
+# Read the main sheet (usually named 'pc5_2024_v1' or similar, adjust as needed)
+cbs_pc5 <- read_excel(cbs_pc5_path, sheet = 1, skip=8) %>%
+  clean_names() 
+cbs_pc5<-cbs_pc5[-1,-c(10:20,22,31,37:131)]
+
+# Read the main sheet (usually named 'pc4_2024_v1' or similar, adjust as needed)
+cbs_pc4 <- read_excel(cbs_pc4_path, sheet = 1,skip = 8) %>%clean_names()
+  cbs_pc4<-cbs_pc4[-1,-c(10:20,22,31,37:132)]
+  
+# Preview the data
+str(cbs_pc6)
+
+process_cbs6_data <- function(df) {
+  df %>%
+    mutate(across(
+      .cols = -postcode_6,
+      .fns = ~ as.numeric(gsub("-99997", "0", .x)), .names = "num_{.col}"
+    )) %>%
+    mutate(
+      female_share = num_vrouw / (num_man + num_vrouw),
+      
+      avg_age = (
+        num_tot_15_jaar * 7.5 +
+        num_x15_tot_25_jaar * 20 +
+        num_x25_tot_45_jaar * 35 +
+        num_x45_tot_65_jaar * 55 +
+        num_x65_jaar_en_ouder * 75
+      ) / (
+        num_tot_15_jaar + num_x15_tot_25_jaar + num_x25_tot_45_jaar + num_x45_tot_65_jaar + num_x65_jaar_en_ouder
+      ),
+      
+      avg_build_year = (
+        num_voor_1945 * 1930 +
+        num_x1945_tot_1965 * 1955 +
+        num_x1965_tot_1975 * 1970 +
+        num_x1975_tot_1985 * 1980 +
+        num_x1985_tot_1995 * 1990 +
+        num_x1995_tot_2005 * 2000 +
+        num_x2005_tot_2015 * 2010 +
+        num_x2015_en_later * 2020
+      ) / (
+        num_voor_1945 + num_x1945_tot_1965 + num_x1965_tot_1975 + num_x1975_tot_1985 +
+        num_x1985_tot_1995 + num_x1995_tot_2005 + num_x2005_tot_2015 + num_x2015_en_later
+      ),
+      
+      rental_share = (
+        num_huurwoning + num_huurcoporatie
+      ) / (
+        num_koopwoning + num_huurwoning + num_huurcoporatie + num_niet_bewoond
+      ),
+      
+      woz_corrected = num_woz_waarde_woning * 1000
+    ) %>%
+    select(postcode_6, female_share, avg_age, huishoudgrootte, avg_build_year, rental_share, woz_corrected)
+}
+
+cbs_pc6_clean <- process_cbs6_data(cbs_pc6)
+
+process_cbs5_data <- function(df) {
+  df %>%
+    mutate(across(
+      .cols = -postcode_5,
+      .fns = ~ as.numeric(gsub("-99997", "0", .x)), .names = "num_{.col}"
+    )) %>%
+    mutate(
+      female_share = num_vrouw / (num_man + num_vrouw),
+      
+      avg_age = (
+        num_tot_15_jaar * 7.5 +
+        num_x15_tot_25_jaar * 20 +
+        num_x25_tot_45_jaar * 35 +
+        num_x45_tot_65_jaar * 55 +
+        num_x65_jaar_en_ouder * 75
+      ) / (
+        num_tot_15_jaar + num_x15_tot_25_jaar + num_x25_tot_45_jaar + num_x45_tot_65_jaar + num_x65_jaar_en_ouder
+      ),
+      
+      avg_build_year = (
+        num_voor_1945 * 1930 +
+        num_x1945_tot_1965 * 1955 +
+        num_x1965_tot_1975 * 1970 +
+        num_x1975_tot_1985 * 1980 +
+        num_x1985_tot_1995 * 1990 +
+        num_x1995_tot_2005 * 2000 +
+        num_x2005_tot_2015 * 2010 +
+        num_x2015_en_later * 2020
+      ) / (
+        num_voor_1945 + num_x1945_tot_1965 + num_x1965_tot_1975 + num_x1975_tot_1985 +
+        num_x1985_tot_1995 + num_x1995_tot_2005 + num_x2005_tot_2015 + num_x2015_en_later
+      ),
+      
+      rental_share = (
+        num_huurwoning + num_huurcoporatie
+      ) / (
+        num_koopwoning + num_huurwoning + num_huurcoporatie + num_niet_bewoond
+      ),
+      
+      woz_corrected = num_woz_waarde_woning * 1000
+    ) %>%
+    select(postcode_5, female_share, avg_age, huishoudgrootte, avg_build_year, rental_share, woz_corrected)
+}
+
+cbs_pc5_clean <- process_cbs5_data(cbs_pc5)
+
+process_cbs4_data <- function(df) {
+  df %>%
+    rename(urban = x133) %>%  # rename before transformation
+    mutate(across(
+      .cols = -c(postcode_4, urban),
+      .fns = ~ as.numeric(gsub("-99997", "0", .x)),
+      .names = "num_{.col}"
+    )) %>%
+    mutate(
+      female_share = num_vrouw / (num_man + num_vrouw),
+      
+      avg_age = (
+        num_tot_15_jaar * 7.5 +
+        num_x15_tot_25_jaar * 20 +
+        num_x25_tot_45_jaar * 35 +
+        num_x45_tot_65_jaar * 55 +
+        num_x65_jaar_en_ouder * 75
+      ) / (
+        num_tot_15_jaar + num_x15_tot_25_jaar + num_x25_tot_45_jaar + num_x45_tot_65_jaar + num_x65_jaar_en_ouder
+      ),
+      
+      avg_build_year = (
+        num_voor_1945 * 1930 +
+        num_x1945_tot_1965 * 1955 +
+        num_x1965_tot_1975 * 1970 +
+        num_x1975_tot_1985 * 1980 +
+        num_x1985_tot_1995 * 1990 +
+        num_x1995_tot_2005 * 2000 +
+        num_x2005_tot_2015 * 2010 +
+        num_x2015_en_later * 2020
+      ) / (
+        num_voor_1945 + num_x1945_tot_1965 + num_x1965_tot_1975 + num_x1975_tot_1985 +
+        num_x1985_tot_1995 + num_x1995_tot_2005 + num_x2005_tot_2015 + num_x2015_en_later
+      ),
+      
+      rental_share = (
+        num_huurwoning + num_huurcoporatie
+      ) / (
+        num_koopwoning + num_huurwoning + num_huurcoporatie + num_niet_bewoond
+      ),
+      
+      woz_corrected = num_woz_waarde_woning * 1000
+    ) %>%
+    select(postcode_4, female_share, avg_age, huishoudgrootte, avg_build_year, rental_share, woz_corrected, urban)
+}
+
+cbs_pc4_clean <- process_cbs4_data(cbs_pc4)
+  
+#Add postcode_5 and postcode_4 to PC6 and PC5
+cbs_pc6_clean <- cbs_pc6_clean %>%
+  mutate(
+    postcode_5 = str_sub(postcode_6, 1, 5),
+    postcode_4 = str_sub(postcode_6, 1, 4)
+  )
+
+cbs_pc5_clean <- cbs_pc5_clean %>%
+  mutate(
+    postcode_4 = str_sub(postcode_5, 1, 4)
+  )
+
+pc6_joined <- cbs_pc6_clean %>%
+  left_join(
+    cbs_pc5_clean %>% select(-postcode_4),
+    by = "postcode_5",
+    suffix = c("_pc6", "_pc5")
+  ) %>%
+  left_join(cbs_pc4_clean, by = "postcode_4")
+
+# Create fallback variables
+fallback <- pc6_joined %>%
+  mutate(
+    female_share = coalesce(female_share_pc6, female_share_pc5, female_share),
+    
+    avg_age = coalesce(avg_age_pc6, avg_age_pc5, avg_age),
+    
+    huishoudgrootte = coalesce(
+      na_if(as.numeric(huishoudgrootte), -99997),
+      na_if(as.numeric(huishoudgrootte_pc5), -99997),
+      na_if(as.numeric(huishoudgrootte), -99997)
+    ),
+    
+    avg_build_year = coalesce(avg_build_year_pc6, avg_build_year_pc5, avg_build_year),
+    
+    rental_share = coalesce(rental_share_pc6, rental_share_pc5, rental_share),
+    
+    woz_corrected = coalesce(
+      na_if(woz_corrected_pc6, 0),
+      na_if(woz_corrected_pc5, 0),
+      na_if(woz_corrected, 0)
+    ),
+    
+    urban = urban
+  ) %>%
+  select(
+    postcode_6,postcode_5,postcode_4, female_share, avg_age, huishoudgrootte,
+    avg_build_year, rental_share, woz_corrected, urban
+  ) 
+
+# Load the 3rd sheet ("Tabel 1") starting after the first 5 rows
+income_raw <- read_excel(
+  "/Users/jeroen/Downloads/Datasegmentation for Jeroen/150911-Gemiddeld-besteedbaar-huishoudinkomen-per-postcode-mw.xls",
+  sheet = "Tabel 1",
+  skip = 9
+)
+
+income_raw<- income_raw[-1,-c(2:3)]
+
+income_raw<-income_raw %>% rename(postcode_4=`Postcode 4-digit`,income_eur = `...4` ) %>% mutate(
+    income_eur = na_if(income_eur, "."),
+    income_eur = as.numeric(income_eur),
+    income_z = (income_eur - 34500) / sd(income_eur, na.rm = TRUE)
+  )
+income_raw$postcode_4 <- as.character(income_raw$postcode_4)
+  
+# Join income_z into fallback dataframe using postcode_4
+fallback <- fallback %>%
+  left_join(income_raw %>% select(postcode_4, income_z), by = "postcode_4")
+
+#income is now robust to inflation, the 34500 was the average income for the year taken, if this changes with new data then use the new average 
+
+
+#only needed if a new BAG geopackage file is used
+#BAG variables 
+
+# Path to the BAG Geopackage file
+bag_path <- "/Users/louisonthepaut/Documents/Paper 3 predicting biases/bag-light.gpkg"
+
+# Load relevant columns from verblijfsobject
+#bag_data <- read_sf(bag_path, layer = "verblijfsobject") %>%
+ # select(
+#   verblijfsobject_id = identificatie,
+#   pand_id = pand_identificatie,
+#   oppervlakte_m2 = oppervlakte,
+#   bouwjaar, 
+#   bag_id= nummeraanduiding_hoofdadres_identificatie
+#  )
+
+#write.csv(
+ #bag_data,
+ # file = "/Users/louisonthepaut/Documents/Paper 3 predicting biases/bag_data.csv",
+  #row.names = FALSE
+#)
+
+bag_data<- read_csv("/Users/jeroen/Downloads/Datasegmentation for Jeroen/cbs_postcode_data/bag_data.csv")
+
+bag_data <- bag_data %>%
+  mutate(
+    year_built_cat = case_when(
+      bouwjaar < 1940 ~ "Vóór 1940",
+      bouwjaar >= 1940 & bouwjaar <= 1970 ~ "Tussen 1940 en 1970",
+      bouwjaar >= 1971 & bouwjaar <= 2000 ~ "Tussen 1971 en 2000",
+      bouwjaar >= 2001 ~ "In 2001 of later",
+      TRUE ~ NA_character_
+    )
+  )
+
+```
+
+```{r}
+#Read in new address list - Since the REL address list is confidential, I'll create a mock dataset for testing
+#This should be updated to whatever addresses you require and thus different data cleaning steps may be required
+
+# Create a mock address dataset using some BAG IDs from our downloaded data
+set.seed(123)
+bag_sample <- bag_data %>% 
+  slice_sample(n = 50) %>%  # Take 50 random buildings
+  select(bag_id)
+
+# Create mock addresses with postcodes that exist in our CBS data
+addresses_clean <- data.frame(
+  `Nummeraanduiding (Bag ID)` = bag_sample$bag_id,
+  Postcode = c("1421AA", "1421AB", "1421AC", "1421AD", "1421AE", 
+               rep(c("1000AA", "1001AA", "1002AA", "1003AA", "1004AA"), 9)),
+  Huisnummer = sample(1:200, 50),
+  Straatnaam = "Test Street"
+) %>%
+  mutate(
+    Postcode = as.character(Postcode),
+    Huisnummer = as.character(Huisnummer)
+  )
+
+print("Created mock address dataset for testing:")
+head(addresses_clean)
+```
+
+```{r}
+#assemble new dataset 
+# First, clean column name to make things easier
+addresses_clean <- addresses_clean %>%
+  rename(bag_id = `Nummeraanduiding (Bag ID)`)
+
+# Now join BAG data and fallback postcode-level variables
+test_dataset <- addresses_clean %>%
+  left_join(
+    bag_data %>%
+      select(bag_id, oppervlakte_m2, year_built_cat),
+    by = c("bag_id" = "bag_id")
+  ) %>%
+  left_join(
+    fallback %>%
+      select(postcode_6, female_share, avg_age, huishoudgrootte, rental_share, urban, income_z),
+    by = c("Postcode" = "postcode_6")
+  )
+
+test_dataset <- test_dataset %>%
+  rename(
+    female        = female_share,
+    age           = avg_age,
+    members       = huishoudgrootte,
+    year_built    = year_built_cat,
+    rental        = rental_share,
+    nettohh_z     = income_z,
+    square_meters = oppervlakte_m2
+  )
+
+```
+
+```{r} 
+# Predict persona class probabilities
+test_predictions <- predict(final_rf_model, data = test_dataset, type = "response")
+
+# Add predictions to test_dataset
+test_dataset$predicted_persona <- test_predictions$predictions
+
+# For probabilities (optional)
+test_probs <- predict(final_rf_model, data = test_dataset, type = "response", predict.all = FALSE)$predictions
+
+# Add class probabilities
+test_dataset <- bind_cols(test_dataset, as.data.frame(test_probs))
+
+table(test_dataset$predicted_persona)
+
+ggplot(test_dataset, aes(x = predicted_persona)) +
+  geom_bar(fill = "steelblue") +
+  labs(title = "Predicted persona distribution", x = "Persona", y = "Count") +
+  theme_minimal()
+
+#Test data set now contains predicted personas for each of the new addresses that we have been given in test_dataset$predicted_persona 
+```
+
