@@ -97,6 +97,7 @@ persona-segmentation/downloads/
 *.pkl
 *.h5
 *.pt
+*.ckpt
 
 # Logs
 *.log

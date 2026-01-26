@@ -1,12 +1,3 @@
-# Copyright Contributors to the ALIGN4Energy Project.
-# SPDX-License-Identifier: Apache-2.0
-
-# The EnergyDiff model is made available via Nan Lin and Pedro P. Vergara
-# from the Delft University of Technology. Nan Lin and Pedro P. Vergara are
-# funded via the ALIGN4Energy Project (with project number NWA.1389.20.251) of
-# the research programme NWA ORC 2020 which is (partly) financed by the Dutch
-# Research Council (NWO), The Netherland.
-
 from enum import Enum
 from typing import Self
 
@@ -14,15 +5,22 @@ from pydantic import BaseModel
 
 from ..base.config import ModelConfigABC, SampleConfigABC
 
+
 # Model
-class DemoModelConfig(ModelConfigABC):
+class EnergyDiffModelConfig(ModelConfigABC):
     device: str = "cpu"
     model_path: str
 
 
 # Sample
-class DemoSampleConfig(SampleConfigABC):
+class EnergyDiffSampleConfig(SampleConfigABC):
+    """
+    Args:
+        batch_size (int): Number of samples to generate in one batch. default is 100.
+        num_steps (int): Number of diffusion steps to use during sampling. default is 200.
+    """
     batch_size: int = 100
+    num_steps: int = 200
 
 
 # Month
@@ -71,11 +69,11 @@ class Month(int, Enum):
         raise TypeError(f"Cannot convert {type(value)} to {cls.__name__}")
 
 
-class DemoSampleCondition(BaseModel):
-    """Conditions that are used by the demo model for sampling.
+class EnergyDiffSampleCondition(BaseModel):
+    """Conditions that are used by the EnergyDiff model for sampling.
     
     Attributes:
-        month (Month): The month of the year.
+        month (Month): The month of the year, indexed from 0 (January) to 11 (December).
         annual_consumption (float): The annual consumption in kWh.
         
     """

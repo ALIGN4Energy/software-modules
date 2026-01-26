@@ -7,11 +7,16 @@
 # the research programme NWA ORC 2020 which is (partly) financed by the Dutch
 # Research Council (NWO), The Netherland.
 
-from .cnflow import FlowModelPL
-from .configuration import ModelConfig, TrainConfig
+from .config import (
+    EnergyDiffModelConfig,
+    EnergyDiffSampleCondition,
+    EnergyDiffSampleConfig,
+)
+from .model import EnergyDiffModel
 
 __all__ = [
-    "ModelConfig",
-    "TrainConfig",
-    "FlowModelPL",
+    'EnergyDiffModel',
+    'EnergyDiffModelConfig',
+    'EnergyDiffSampleCondition',
+    'EnergyDiffSampleConfig',
 ]

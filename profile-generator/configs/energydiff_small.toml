@@ -1,0 +1,22 @@
+# configuration for EnergyDiff Enelogic small model
+# date: 2025-12-01
+# author: Nan Lin
+
+[model]
+dim_base = 128
+dim_feedforward = 512
+num_attn_head = 8
+dropout = 0.1
+num_encoder_layers = 12
+
+[train]
+batch_size = 128
+lr = 0.0001
+adam_betas = [0.9, 0.999]
+ema_update_every = 5
+ema_decay = 0.9999
+num_train_step = 100000
+save_and_sample_every = 50000
+val_sampling_step = 100
+val_every = 2500
+gradient_accumulate_every = 1

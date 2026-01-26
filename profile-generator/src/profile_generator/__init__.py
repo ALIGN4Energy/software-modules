@@ -1,11 +1,13 @@
-"""
-DELFT UNIVERSITY OF TECHNOLOGY
+# Copyright Contributors to the ALIGN4Energy Project.
+# SPDX-License-Identifier: Apache-2.0
 
-Oct 15, 2025
+# The EnergyDiff model is made available via Nan Lin and Pedro P. Vergara
+# from the Delft University of Technology. Nan Lin and Pedro P. Vergara are
+# funded via the ALIGN4Energy Project (with project number NWA.1389.20.251) of
+# the research programme NWA ORC 2020 which is (partly) financed by the Dutch
+# Research Council (NWO), The Netherland.
 
-Nan Lin
-"""
+from .interfaces import demo_model, energydiff
 from .models import demo_nn
-from .interfaces import demo_model
 
-__all__ = ['demo_nn', 'demo_model']
+__all__ = ['demo_nn', 'demo_model', 'energydiff']
