@@ -1,5 +1,11 @@
 # Energy Usage Prediction and Recommendation
 
+---
+
+*This publication is part of the project ALIGN4energy (with project number NWA.1389.20.251) of the research programme NWA ORC 2020 which is (partly) financed by the Dutch Research Council (NWO).*
+
+---
+
 Three independent Docker-packaged models for Dutch household energy analysis.
 
 ## Models
