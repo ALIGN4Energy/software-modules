@@ -420,7 +420,7 @@ class Household(Agent):
 class HeatingModel(Model):
     def __init__(self, seed: int, csv_file_path: str, tech_config_path: str = "technology_config.csv",
                  policy_support: bool = False, peer_effect_strength: float = 0.2):
-        super().__init__(seed=int(seed))
+        super().__init__(rng=np.random.default_rng(int(seed)))
         self.rng = np.random.default_rng(seed)
 
         # Model parameters

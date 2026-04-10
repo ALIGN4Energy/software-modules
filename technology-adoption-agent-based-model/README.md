@@ -41,13 +41,13 @@ docker run --rm technology-adoption-abm help
 ### Option 2: Local Python Installation
 
 **Prerequisites:**
-- Python 3.11+ with packages: `numpy`, `pandas`, `mesa`
+- Python 3.11+ with packages: `numpy`, `pandas`, `mesa`, `networkx`
 
 **Steps:**
 
 ```bash
 # Install dependencies
-pip install numpy pandas mesa
+pip install numpy pandas mesa networkx
 
 # Run simulation with tutorial data
 python run_abm.py --household_data tutorial_households.csv --tech_config tutorial_technologies.csv
@@ -241,7 +241,7 @@ Households choose the option (or status quo) with highest utility, subject to af
 ## Project Structure
 
 ```
-ABM-deliverables/
+technology-adoption-agent-based-model/
 ├── Dockerfile                 # Container definition
 ├── docker-entrypoint.sh      # Container entrypoint script
 ├── README.md                 # This file
@@ -251,8 +251,8 @@ ABM-deliverables/
 ├── ABM.py                    # Core agent-based model
 ├── run_abm.py                # Wrapper script for Docker
 │
-├── household_data_example.csv        # Household characteristics (example)
-├── technology_config_example.csv     # Technology attributes (example)
+├── tutorial_households.csv   # Household characteristics (tutorial data)
+├── tutorial_technologies.csv # Technology attributes (tutorial data)
 │
 └── output/                   # Results directory
     ├── monte_carlo_results.csv
@@ -327,7 +327,7 @@ docker run --rm -it abm bash
 docker run --rm abm test
 
 # Validate Python packages
-python -c "import numpy, pandas, mesa; print('OK')"
+python -c "import numpy, pandas, mesa, networkx; print('OK')"
 ```
 
 ## Model Background

@@ -6,13 +6,18 @@ WORKDIR /app
 
 # Install required Python packages
 RUN pip install --no-cache-dir \
-    numpy==1.26.4 \
-    pandas==2.2.0 \
-    mesa==2.2.4
+    numpy \
+    pandas \
+    mesa \
+    networkx
 
 # Copy the ABM files
 COPY ABM.py /app/
 COPY run_abm.py /app/
+
+# Copy tutorial data files
+COPY tutorial_households.csv /app/
+COPY tutorial_technologies.csv /app/
 
 # Copy entrypoint script
 COPY docker-entrypoint.sh /app/
