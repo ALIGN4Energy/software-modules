@@ -3,71 +3,96 @@ set -e
 
 # Docker entrypoint for Dutch Address Persona Segmentation
 echo "=== Dutch Address Persona Segmentation ==="
-echo "Container started at $(date)"
 
-# Create output directory if it doesn't exist
-mkdir -p /app/output
+CBS_YEAR="${PERSONA_CBS_YEAR:-2025}"
+INCOME_YEAR="${PERSONA_INCOME_YEAR:-2023}"
 
-# Default addresses if none provided
-DEFAULT_POSTCODE1="2051ER"
-DEFAULT_POSTCODE2="2051NA"
-DEFAULT_NUMBER1="2"
-DEFAULT_NUMBER2="13-D"
+usage() {
+    cat <<EOF
 
-# Parse command line arguments
-if [ "$#" -eq 0 ]; then
-    echo "Using default addresses: $DEFAULT_POSTCODE1 #$DEFAULT_NUMBER1 and $DEFAULT_POSTCODE2 #$DEFAULT_NUMBER2"
-    exec Rscript /app/run_datasegmentation.R "$DEFAULT_POSTCODE1" "$DEFAULT_POSTCODE2" "$DEFAULT_NUMBER1" "$DEFAULT_NUMBER2"
-elif [ "$1" = "help" ] || [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
-    echo ""
-    echo "Usage: docker run [options] datasegmentation [POSTCODE1] [POSTCODE2] [NUMBER1] [NUMBER2]"
-    echo ""
-    echo "Arguments:"
-    echo "  POSTCODE1    First 6-digit Dutch postcode (e.g., 1011AB)"
-    echo "  POSTCODE2    Second 6-digit Dutch postcode (e.g., 2051ER)"
-    echo "  NUMBER1      First house number (e.g., 12, 5A, 123-C)"
-    echo "  NUMBER2      Second house number (e.g., 5, 25B, 10-D)"
-    echo ""
-    echo "Examples:"
-    echo "  # Use default addresses"
-    echo "  docker run --rm -v \$(pwd)/output:/app/output datasegmentation"
-    echo ""
-    echo "  # Custom addresses"
-    echo "  docker run --rm -v \$(pwd)/output:/app/output datasegmentation 1011AB 2051ER 12 5A"
-    echo ""
-    echo "  # Rural vs urban comparison"
-    echo "  docker run --rm -v \$(pwd)/output:/app/output datasegmentation 7411AA 1012JS 8 156"
-    echo ""
-    echo "Output will be saved to ./output/user_predictions.csv"
-    echo ""
-    exit 0
-elif [ "$1" = "test" ]; then
-    echo "Running container health check..."
-    echo "R version: $(R --version | head -1)"
-    echo "Python version: $(python3 --version)"
-    echo "Required R packages:"
-    Rscript -e "packages <- c('dplyr', 'ranger', 'caret', 'readxl'); sapply(packages, function(p) cat(sprintf('  %s: %s\n', p, packageVersion(p))))"
-    echo "Data files:"
-    ls -la /app/*.csv /app/*.xls 2>/dev/null || echo "  Training data files not found"
-    ls -la /app/cbs_postcode_data/ 2>/dev/null || echo "  CBS data not downloaded"
-    echo "Container test completed successfully"
-    exit 0
-elif [ "$1" = "bash" ] || [ "$1" = "shell" ]; then
-    echo "Starting interactive bash shell..."
-    exec /bin/bash
-elif [ "$1" = "Rscript" ]; then
-    # Pass through Rscript commands
-    exec "$@"
-elif [ "$#" -eq 1 ]; then
-    echo "Error: Please provide both postcodes and house numbers, or use 'help' for usage information"
-    exit 1
-elif [ "$#" -eq 2 ]; then
-    echo "Using provided postcodes with default house numbers"
-    exec Rscript /app/run_datasegmentation.R "$1" "$2" "$DEFAULT_NUMBER1" "$DEFAULT_NUMBER2"
-elif [ "$#" -eq 4 ]; then
-    echo "Using provided postcodes: $1 #$3 and $2 #$4"
-    exec Rscript /app/run_datasegmentation.R "$1" "$2" "$3" "$4"
-else
-    echo "Error: Invalid number of arguments. Use 'help' for usage information"
-    exit 1
-fi
+Usage: docker run [options] persona-segmentation COMMAND
+
+Commands:
+  download                    Download CBS and BAG open data into /data (once, about 8 GB)
+  (no command)                Predict personas for examples/addresses_example.csv
+  POSTCODE NUMBER [...]       Predict personas for one or more postcode + house number pairs
+  FILE.csv | FILE.xlsx        Predict personas for an address file (path inside the container)
+  test                        Check the R packages, the model and the open data
+  help                        Show this message
+  bash                        Start a shell
+
+Mount a folder on /data for the open data and a folder on /app/output for the results.
+
+Examples:
+  docker run --rm -v persona-data:/data persona-segmentation download
+  docker run --rm -v persona-data:/data -v \$(pwd)/output:/app/output persona-segmentation
+  docker run --rm -v persona-data:/data -v \$(pwd)/output:/app/output persona-segmentation 1011AB 12 2514JG 20
+  docker run --rm -v persona-data:/data -v \$(pwd)/output:/app/output -v \$(pwd)/addresses.csv:/app/input.csv persona-segmentation /app/input.csv
+
+Environment: PERSONA_CBS_YEAR (default 2025), PERSONA_INCOME_YEAR (default 2023),
+PERSONA_REBUILD_CACHE=TRUE to rebuild the cache after downloading new data.
+
+Results are written to /app/output/persona_predictions.csv and .xlsx.
+EOF
+}
+
+require_open_data() {
+    if [ ! -f "/data/cache/bag_verblijfsobjecten.csv" ] && [ ! -f "/data/bag-light.gpkg" ]; then
+        echo "Error: no open data in /data. Mount a volume on /data and run the 'download' command first."
+        exit 1
+    fi
+}
+
+predict() {
+    require_open_data
+    mkdir -p /app/output
+    # Run from /tmp so stray plot files do not end up in /app
+    cd /tmp && exec Rscript /app/persona_assignment.R
+}
+
+case "$1" in
+    help|--help|-h)
+        usage
+        ;;
+    download)
+        exec python3 /app/download_netherlands_data.py /data "$CBS_YEAR" "$INCOME_YEAR"
+        ;;
+    test)
+        echo "R version: $(R --version | head -1)"
+        Rscript -e "for (p in c('tidyverse', 'data.table', 'janitor', 'readxl', 'writexl', 'ranger', 'sf')) cat(sprintf('  %s: %s\n', p, packageVersion(p)))"
+        Rscript -e "b <- readRDS('/app/models/persona_rf.rds'); cat(sprintf('Model: trained %s, n = %d, %d trees\n', b\$training\$date, b\$training\$n_obs, b\$training\$num_trees))"
+        echo "Open data in /data:"
+        ls -la /data
+        ;;
+    bash|shell)
+        exec /bin/bash
+        ;;
+    Rscript)
+        exec "$@"
+        ;;
+    "")
+        echo "Using example addresses: /app/examples/addresses_example.csv"
+        predict
+        ;;
+    *.csv|*.xlsx|*.xls)
+        if [ ! -f "$1" ]; then
+            echo "Error: address file $1 not found inside the container. Mount it with -v."
+            exit 1
+        fi
+        export PERSONA_ADDRESSES="$1"
+        predict
+        ;;
+    *)
+        if [ $(( $# % 2 )) -ne 0 ]; then
+            echo "Error: give postcode and house number pairs, e.g. 1011AB 12 2514JG 20. Use 'help' for usage."
+            exit 1
+        fi
+        echo "postcode,huisnummer" > /tmp/addresses.csv
+        while [ "$#" -gt 0 ]; do
+            echo "$1,$2" >> /tmp/addresses.csv
+            shift 2
+        done
+        export PERSONA_ADDRESSES=/tmp/addresses.csv
+        predict
+        ;;
+esac

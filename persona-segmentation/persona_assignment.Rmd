@@ -1,0 +1,908 @@
+---
+title: "Persona assignment from open data"
+author: "Louison Thépaut (IVM, VU Amsterdam)"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+rm(list = ls())
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+<!--
+============================================================================
+ADDRESSES IN, PERSONAS OUT.
+
+This file is self-contained: it does not source any other script. It reads
+  1. the trained random forest shipped with the repository (models/persona_rf.rds),
+  2. open data: CBS "Kerncijfers per postcode" (three Excel files for the
+     demographics year, two for the income year) and the BAG geopackage,
+  3. your address list (CSV or XLSX: postcode, house number, BAG ID),
+and writes one row per address with the features used and the predicted persona.
+
+The open data is read ONCE and cached as CSV files in cache_dir (the BAG
+geopackage is the slow step, a few minutes). Every later run just reads the
+cache. Set rebuild_cache <- TRUE when you download a new CBS release.
+
+What to edit: the CONFIG chunk. Where to download the data: README.md.
+Run it with Knit (RStudio) or chunk by chunk; both work.
+
+How an address becomes a persona
+--------------------------------
+BAG: matched by nummeraanduiding ID, then verblijfsobject ID, then postcode +
+house number. Gives floor area and construction year.
+CBS: per variable, the PC6 value if published, else PC5, else PC4. Missing-value
+codes (-99997 ...) are never treated as numbers.
+Income: z-scored on the CBS postcode mean/SD of income_year. The survey side of
+the model was z-scored on its own mean/SD, so a split in the forest means
+"this many SDs above the population mean" on both sides.
+Anything still missing gets a population fall-back and is flagged per row.
+The forest predicts four classes; predicted Erratic (Class3) is folded into
+Comfort (Class4) for deployment. Both columns are in the output.
+============================================================================
+-->
+
+```{r config}
+## ---- CONFIG: the only chunk you need to edit -----------------------------
+
+# The PERSONA_* environment variables override the defaults below; the Docker
+# image uses them. In RStudio, just edit the defaults.
+env <- function(name, default) { v <- Sys.getenv(name); if (nzchar(v)) v else default }
+
+# Folder with the open-data downloads (sub-folders are fine, keep file names)
+data_dir    <- env("PERSONA_DATA_DIR", "~/persona-data")
+cbs_year    <- as.integer(env("PERSONA_CBS_YEAR", 2025))     # CBS demographics: pc6/pc5/pc4_<year>_*.xlsx
+income_year <- as.integer(env("PERSONA_INCOME_YEAR", 2023))  # CBS household income: pc5/pc4_<year>_vol.xlsx (normally cbs_year - 2)
+bag_gpkg    <- file.path(data_dir, "bag-light.gpkg")
+cache_dir   <- file.path(data_dir, "cache")   # CSV cache written on the first run
+rebuild_cache <- as.logical(env("PERSONA_REBUILD_CACHE", FALSE))  # TRUE = read the raw files again
+
+# Your addresses: a CSV/XLSX path (relative paths are taken from the repository
+# folder), or a data.frame typed straight in, e.g.
+# addresses <- data.frame(postcode = c("1011AB", "3011AD"), huisnummer = c("12", "5A"),
+#                         bag_id = c("0363200000123456", "0599200000123456"))
+addresses       <- env("PERSONA_ADDRESSES", "examples/addresses_example.csv")
+addresses_sheet <- NULL      # XLSX only: sheet name or number, NULL = first sheet
+addresses_skip  <- 0         # rows above the header row
+address_col_map <- list()    # force a column if auto-detection picks the wrong one,
+                             # e.g. list(bag_id = "Woningcode", postcode = "Postcode 6")
+
+# Output (relative paths are taken from the repository folder)
+output_dir       <- env("PERSONA_OUTPUT_DIR", "output")
+path_output_csv  <- file.path(output_dir, "persona_predictions.csv")    # everything: features, diagnostics, personas
+path_output_xlsx <- file.path(output_dir, "persona_predictions.xlsx")   # same table as a workbook; NULL to skip
+
+# The repository folder is found automatically (see the locate chunk). Only
+# set it here if that fails, e.g. repo_dir <- "~/persona-segmentation".
+repo_dir <- env("PERSONA_REPO_DIR", NULL)
+## ---------------------------------------------------------------------------
+```
+
+```{r libraries}
+required_packages <- c("tidyverse", "data.table", "janitor", "readxl", "writexl", "ranger")
+to_install <- setdiff(required_packages, rownames(installed.packages()))
+if (length(to_install) > 0) install.packages(to_install)
+# "sf" is only needed the first time, to read the BAG geopackage; installed then.
+
+library(tidyverse)
+library(data.table)
+library(janitor)
+library(readxl)
+library(writexl)
+library(ranger)
+```
+
+```{r locate}
+# The repository folder: where this Rmd, models/persona_rf.rds and examples/ live.
+if (is.null(repo_dir)) {
+  repo_dir <- tryCatch(dirname(normalizePath(knitr::current_input(dir = TRUE))), error = function(e) NULL)
+  if (is.null(repo_dir) && requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable())
+    repo_dir <- tryCatch(dirname(rstudioapi::getSourceEditorContext()$path), error = function(e) NULL)
+  if (is.null(repo_dir) || repo_dir == "") repo_dir <- getwd()
+}
+repo_dir   <- path.expand(repo_dir)
+model_path <- file.path(repo_dir, "models", "persona_rf.rds")
+if (!file.exists(model_path)) {
+  stop("Cannot find models/persona_rf.rds under ", repo_dir,
+       ". Set repo_dir in the config chunk to the folder you cloned from GitHub.", call. = FALSE)
+}
+from_repo <- function(p) if (is.null(p) || grepl("^(/|~|[A-Za-z]:)", p)) path.expand(p) else file.path(repo_dir, p)
+cat("Repository folder:", repo_dir, "\n")
+```
+
+# Functions
+
+Everything the pipeline needs, in one place. You should not have to touch this
+chunk unless CBS renames a column (then edit the pattern in `CBS_VARS`).
+
+```{r functions}
+# ---- constants ---------------------------------------------------------------
+
+# Features in the order the forest expects them (also stored in the model bundle).
+MODEL_FEATURES <- c("female", "age", "members", "year_built", "rental", "urban",
+                    "nettohh_z", "square_meters")
+
+# LISS labels of the construction-period variable. The training template checks
+# that the survey data really uses these; the field side is labelled from the
+# levels stored in the model bundle, so the two can never drift apart.
+# "\u00f3" spells the accented o so the file works in any locale
+YEAR_BUILT_LEVELS <- c("V\u00f3\u00f3r 1940", "Tussen 1940 en 1970",
+                       "Tussen 1971 en 2000", "In 2001 of later")
+YEAR_BUILT_BREAKS <- c(1940, 1971, 2001)   # bouwjaar < 1940 | 1940-1970 | 1971-2000 | >= 2001
+
+CLASS_LABELS <- c(Class1 = "Financially", Class2 = "Policy",
+                  Class3 = "Erratic",     Class4 = "Comfort")
+
+# Deployment rule: Erratic choosers receive the Comfort letter. This is applied
+# AFTER the forest has been trained and evaluated as a four-class model.
+FOLD_RULE <- c(Class3 = "Class4")
+
+CBS_SENTINEL_LIMIT <- -9000              # values below this are CBS missing codes
+BAG_AREA_RANGE     <- c(10, 2000)        # m2; outside -> NA (BAG placeholders: 1, 999999)
+BAG_YEAR_RANGE     <- c(1500, as.integer(format(Sys.Date(), "%Y")) + 2)
+
+# CBS variables we read, matched by name on the cleaned Excel header. If CBS
+# renames a column, edit the pattern here (the error message lists what it found).
+#   to = what a missing-value code becomes: 0 for counts, NA for anything else
+CBS_VARS <- list(
+  man             = list(pattern = "^(aantal_)?man(nen)?$",                 required = TRUE,  to = 0),
+  vrouw           = list(pattern = "^(aantal_)?vrouw(en)?$",                required = TRUE,  to = 0),
+  age_0_15        = list(pattern = "tot_15_jaar$",                          required = TRUE,  to = 0),
+  age_15_25       = list(pattern = "15_tot_25_jaar$",                       required = TRUE,  to = 0),
+  age_25_45       = list(pattern = "25_tot_45_jaar$",                       required = TRUE,  to = 0),
+  age_45_65       = list(pattern = "45_tot_65_jaar$",                       required = TRUE,  to = 0),
+  age_65_plus     = list(pattern = "65_jaar_(en|of)_ouder",                             required = TRUE,  to = 0),
+  huishoudgrootte = list(pattern = "huishoud(ens)?grootte",                 required = TRUE,  to = NA),
+  huurwoning      = list(pattern = "^(percentage_|p_|aandeel_)?huurwoning(en)?$", required = TRUE, to = NA),
+  koopwoning      = list(pattern = "^(percentage_|p_|aandeel_)?koopwoning(en)?$", required = FALSE, to = NA),
+  woningen        = list(pattern = "^(aantal_)?woningen$",                  required = FALSE, to = 0),
+  woz             = list(pattern = "woz",                                   required = FALSE, to = NA),
+  inkomen         = list(pattern = "inkomen",                               required = FALSE, to = NA),
+  stedelijkheid   = list(pattern = "stedelijk",                             required = FALSE, to = NA)
+)
+
+# ---- small utilities ---------------------------------------------------------
+
+say <- function(...) cat(sprintf(...), "\n", sep = "")
+
+`%||%` <- function(a, b) if (is.null(a)) b else a
+
+normalise_postcode <- function(x) {
+  x <- toupper(gsub("\\s+", "", as.character(x)))
+  x[is.na(x) | x == ""] <- NA_character_
+  x
+}
+
+is_valid_pc6 <- function(x) !is.na(x) & grepl("^[1-9][0-9]{3}[A-Z]{2}$", x)
+
+# Turn anything (numeric, text, "1.9632e+15", "01963200000012345") into a clean
+# 16-digit BAG ID or NA. Returns a character vector; attr "status" says what
+# happened to each element.
+normalise_bag_id <- function(x, width = 16L) {
+  raw <- if (is.numeric(x)) sprintf("%.0f", x) else as.character(x)
+  raw <- trimws(raw)
+  raw[is.na(raw) | raw == "" | raw == "NA"] <- NA_character_
+
+  status <- rep("ok", length(raw))
+  status[is.na(raw)] <- "missing"
+
+  # Scientific notation means the digits are already gone: refuse to guess.
+  sci <- !is.na(raw) & grepl("[eE][+-]?[0-9]", raw)
+  status[sci] <- "invalid (scientific notation, digits lost)"
+  raw[sci] <- NA_character_
+
+  x <- sub("\\.0+$", "", raw)          # "363200000123456.0"
+  x <- gsub("[^0-9]", "", x)           # keep digits only
+
+  short <- !is.na(x) & nchar(x) < width & nchar(x) > 0
+  x[short] <- str_pad(x[short], width, side = "left", pad = "0")
+  status[short] <- "padded (leading zeros restored)"
+
+  long <- !is.na(x) & nchar(x) > width
+  x[long] <- sub(paste0("^0+(?=[0-9]{", width, "}$)"), "", x[long], perl = TRUE)
+  status[long & !is.na(x) & nchar(x) == width] <- "trimmed (spurious leading zeros removed)"
+
+  bad <- !is.na(x) & nchar(x) != width
+  status[bad] <- "invalid (not 16 digits)"
+  x[bad] <- NA_character_
+  x[!is.na(x) & x == ""] <- NA_character_
+
+  attr(x, "status") <- status
+  x
+}
+
+# BAG object type sits in digits 5-6 of the ID.
+bag_id_type <- function(x) {
+  t <- substr(x, 5, 6)
+  dplyr::case_when(t == "20" ~ "nummeraanduiding", t == "01" ~ "verblijfsobject",
+                   t == "10" ~ "pand", t == "02" ~ "ligplaats", t == "03" ~ "standplaats",
+                   TRUE ~ "unknown")
+}
+
+# "12", "12A", "12-D", "10-2", "12 A 3" -> number, letter, toevoeging
+parse_huisnummer <- function(x) {
+  x <- trimws(as.character(x))
+  m <- str_match(x, "^([0-9]+)\\s*[-/]?\\s*([A-Za-z]?)\\s*[-/]?\\s*(.*)$")
+  tibble(huisnummer = suppressWarnings(as.integer(m[, 2])),
+         huisletter = tolower(m[, 3]),
+         toevoeging = tolower(gsub("[^A-Za-z0-9]", "", m[, 4])))
+}
+
+address_key <- function(postcode, huisnummer, huisletter = "", toevoeging = "") {
+  hl <- tolower(trimws(coalesce(as.character(huisletter), "")))
+  tv <- tolower(gsub("[^A-Za-z0-9]", "", coalesce(as.character(toevoeging), "")))
+  key <- paste(normalise_postcode(postcode), as.integer(huisnummer), hl, tv, sep = "|")
+  key[is.na(postcode) | is.na(huisnummer)] <- NA_character_
+  key
+}
+
+cbs_num <- function(x, sentinel_to = NA_real_) {
+  x <- as.character(x)
+  # Some CBS columns (income in the "vol" files) are text with a decimal comma: "41,0"
+  x <- sub("^(-?[0-9]+),([0-9]+)$", "\\1.\\2", x)
+  x <- suppressWarnings(as.numeric(x))
+  x[!is.na(x) & x < CBS_SENTINEL_LIMIT] <- sentinel_to
+  x
+}
+
+# ---- CBS postcode files -------------------------------------------------------
+
+# Find pc<level>_<year>_*.xlsx anywhere under data_dir. Prefers the most
+# complete release (vol > v2 > v1) when several exist.
+find_cbs_file <- function(data_dir, level, year) {
+  pat   <- sprintf("^(.*[_-])?pc%d[_-]%d[^/]*\\.xlsx?$", level, year)   # pc6_2025_v1.xlsx, cbs_pc6_2025_v1.xlsx, ...
+  files <- list.files(data_dir, pattern = pat, recursive = TRUE, full.names = TRUE,
+                      ignore.case = TRUE)
+  files <- files[!grepl("^~\\$", basename(files))]          # Excel lock files
+  if (length(files) == 0) {
+    stop(sprintf(paste(
+      "No CBS file for PC%d, year %d found under '%s'.",
+      "Download 'Kerncijfers per postcode' from",
+      "https://www.cbs.nl/nl-nl/dossier/nederland-regionaal/geografische-data/gegevens-per-postcode",
+      "unzip it anywhere inside that folder, and keep the original file name (e.g. pc%d_%d_v2.xlsx)."),
+      level, year, data_dir, level, year), call. = FALSE)
+  }
+  rank <- ifelse(grepl("vol", basename(files), ignore.case = TRUE), 3,
+          ifelse(grepl("v2",  basename(files), ignore.case = TRUE), 2, 1))
+  files[order(-rank, basename(files))][1]
+}
+
+# The CBS workbooks have a title block, then a header row, then a units row,
+# then the data. Row positions differ between releases, so we look for the row
+# whose first cell starts with "Postcode" instead of hard-coding skip = 8.
+detect_cbs_header <- function(preview) {
+  first <- tolower(trimws(as.character(preview[[1]])))
+  h <- which(grepl("^(postcode|pc[456]\\b)", first))[1]
+  if (is.na(h)) {
+    # maybe the postcode column is not the first one
+    hits <- which(apply(preview, 1, function(r) any(grepl("^postcode", tolower(trimws(r))))))
+    h <- hits[1]
+  }
+  if (is.na(h)) stop("Could not find the header row (a row starting with 'Postcode') in the CBS file.", call. = FALSE)
+  h
+}
+
+# Match CBS_VARS patterns against cleaned header names. Returns a named integer
+# vector of column positions (NA for optional variables that are absent).
+match_cbs_columns <- function(clean_names, level) {
+  idx <- sapply(names(CBS_VARS), function(v) {
+    hits <- which(grepl(CBS_VARS[[v]]$pattern, clean_names, ignore.case = TRUE))
+    if (v == "inkomen" && length(hits) > 1) hits <- hits[grepl("gemiddeld|gem_", clean_names[hits])]
+    if (length(hits) == 1) return(hits)
+    if (length(hits) == 0) return(NA_integer_)
+    stop(sprintf("Several columns match '%s' in the PC%d file: %s. Tighten CBS_VARS$%s$pattern in the functions chunk.",
+                 v, level, paste(clean_names[hits], collapse = ", "), v), call. = FALSE)
+  })
+  missing_required <- names(CBS_VARS)[sapply(CBS_VARS, `[[`, "required") & is.na(idx)]
+  if (length(missing_required) > 0) {
+    stop(sprintf(paste(
+      "PC%d file: could not find column(s) %s.",
+      "Cleaned header names in the file are:\n  %s\n",
+      "Adjust the matching pattern(s) in CBS_VARS (functions chunk of this file)."),
+      level, paste(missing_required, collapse = ", "), paste(clean_names, collapse = ", ")), call. = FALSE)
+  }
+  idx
+}
+
+# Read one CBS postcode workbook and return a clean tibble: postcode + the
+# CBS_VARS columns as numbers (missing codes handled), one row per postcode.
+read_cbs_sheet <- function(path, level, sheet = 1) {
+  say("  reading %s ...", basename(path))
+  preview <- suppressMessages(read_excel(path, sheet = sheet, col_names = FALSE,
+                                         col_types = "text", n_max = 30))
+  h <- detect_cbs_header(preview)
+  header <- as.character(preview[h, ])
+  # Fill empty header cells from the row above or below (CBS sometimes puts the
+  # label of the last column, Stedelijkheid, on another header line).
+  for (j in seq_along(header)) {
+    if (is.na(header[j]) || trimws(header[j]) == "") {
+      cand <- c(if (h > 1) preview[[j]][h - 1] else NA, preview[[j]][h + 1])
+      cand <- cand[!is.na(cand) & trimws(cand) != ""]
+      if (length(cand) > 0) header[j] <- cand[1]
+    }
+  }
+  clean <- suppressWarnings(make_clean_names(ifelse(is.na(header) | header == "", paste0("col", seq_along(header)), header)))
+
+  idx <- match_cbs_columns(clean, level)
+  # Stedelijkheid: only in PC5/PC4; CBS has shipped it with an empty header.
+  if (level %in% c(4, 5) && is.na(idx["stedelijkheid"])) {
+    if (grepl("^col[0-9]+$", clean[length(clean)])) {
+      idx["stedelijkheid"] <- length(clean)
+      say("  note: no column named 'Stedelijkheid' in the PC%d file; using the unlabelled last column (%d) as urbanity.",
+          level, length(clean))
+    } else {
+      say("  note: no urbanity (Stedelijkheid) column in the PC%d file.", level)
+    }
+  }
+
+  # Second pass: read only the columns we need, everything as text.
+  keep  <- c(1L, idx[!is.na(idx)])
+  types <- rep("skip", length(clean))
+  types[keep] <- "text"
+  if (anyDuplicated(keep)) stop("Two CBS variables matched the same column; tighten the patterns in CBS_VARS.", call. = FALSE)
+  dat <- suppressMessages(read_excel(path, sheet = sheet, col_names = FALSE,
+                                     col_types = types, skip = h))
+  # readxl returns the kept columns in file order, so name them by ascending position
+  nm  <- c("postcode", names(idx)[!is.na(idx)])
+  if (ncol(dat) != length(nm)) stop("Unexpected column count when re-reading ", basename(path), call. = FALSE)
+  dat <- setNames(dat, nm[order(keep)])
+
+  pc_pattern <- c(`6` = "^[1-9][0-9]{3}[A-Z]{2}$", `5` = "^[1-9][0-9]{3}[A-Z]$", `4` = "^[1-9][0-9]{3}$")[[as.character(level)]]
+  dat <- dat %>%
+    mutate(postcode = normalise_postcode(postcode)) %>%
+    filter(!is.na(postcode), grepl(pc_pattern, postcode)) %>%
+    distinct(postcode, .keep_all = TRUE)
+  for (v in setdiff(names(dat), "postcode")) dat[[v]] <- cbs_num(dat[[v]], CBS_VARS[[v]]$to)
+  say("  %s: %s postcodes, columns: %s", basename(path), format(nrow(dat), big.mark = ","),
+      paste(setdiff(names(dat), "postcode"), collapse = ", "))
+  dat
+}
+
+# Derived features for one level (PC6, PC5 or PC4).
+derive_cbs_features <- function(d) {
+  pop_sex <- d$man + d$vrouw
+  d$female_share <- ifelse(!is.na(pop_sex) & pop_sex > 0, d$vrouw / pop_sex, NA_real_)
+
+  pop_age <- d$age_0_15 + d$age_15_25 + d$age_25_45 + d$age_45_65 + d$age_65_plus
+  d$avg_age <- ifelse(!is.na(pop_age) & pop_age > 0,
+                      (d$age_0_15 * 7.5 + d$age_15_25 * 20 + d$age_25_45 * 35 +
+                         d$age_45_65 * 55 + d$age_65_plus * 75) / pop_age, NA_real_)
+
+  # CBS publishes koop/huur as percentages of the housing stock in the postcode
+  # files; some custom extracts carry counts. Detect which and do the right thing.
+  if ("koopwoning" %in% names(d)) {
+    both <- d$huurwoning + d$koopwoning
+    pct_like <- median(both[!is.na(both) & both > 0])
+  } else pct_like <- NA
+  if (is.finite(pct_like) && pct_like >= 70 && pct_like <= 110) {
+    d$rental_share <- d$huurwoning / 100
+    attr(d, "rental_basis") <- "percentage"
+  } else if ("woningen" %in% names(d)) {
+    d$rental_share <- ifelse(!is.na(d$woningen) & d$woningen > 0, d$huurwoning / d$woningen, NA_real_)
+    attr(d, "rental_basis") <- "count / total dwellings"
+  } else {
+    d$rental_share <- d$huurwoning / 100
+    attr(d, "rental_basis") <- "percentage (assumed)"
+  }
+  d$rental_share[!is.na(d$rental_share) & (d$rental_share < 0 | d$rental_share > 1)] <- NA_real_
+
+  if ("woz" %in% names(d)) d$woz_eur <- ifelse(!is.na(d$woz) & d$woz > 0, d$woz * 1000, NA_real_)
+  if ("stedelijkheid" %in% names(d)) {
+    d$urban <- d$stedelijkheid
+    d$urban[!is.na(d$urban) & !(d$urban %in% 1:5)] <- NA_real_
+  }
+  if ("inkomen" %in% names(d)) d$income_eur <- ifelse(!is.na(d$inkomen) & d$inkomen > 0, d$inkomen * 1000, NA_real_)
+  d
+}
+
+# Build the three CBS tables (PC6, PC5, PC4) plus the income z-score.
+# income_year may equal cbs_year if that release already carries income.
+build_cbs_tables <- function(data_dir, cbs_year, income_year = cbs_year - 1) {
+  say("CBS demographics, year %d", cbs_year)
+  raw <- list(
+    pc6 = read_cbs_sheet(find_cbs_file(data_dir, 6, cbs_year), 6),
+    pc5 = read_cbs_sheet(find_cbs_file(data_dir, 5, cbs_year), 5),
+    pc4 = read_cbs_sheet(find_cbs_file(data_dir, 4, cbs_year), 4))
+  tabs <- lapply(raw, derive_cbs_features)
+  say("  rental share basis: %s", attr(tabs$pc6, "rental_basis"))
+
+  # Income: PC5 preferred, PC4 fallback. Only the 'vol' release carries it.
+  say("CBS household income, year %d", income_year)
+  inc <- list()
+  for (lv in c(5, 4)) {
+    f <- find_cbs_file(data_dir, lv, income_year)
+    t <- if (income_year == cbs_year) raw[[paste0("pc", lv)]] else read_cbs_sheet(f, lv)
+    if (!"inkomen" %in% names(t)) {
+      stop(sprintf(paste(
+        "The PC%d file for %d (%s) has no income column.",
+        "Household income is only published in the 'vol' release, normally two years behind the demographics.",
+        "Set income_year to a year for which pc5_<year>_vol.xlsx and pc4_<year>_vol.xlsx exist."),
+        lv, income_year, basename(f)), call. = FALSE)
+    }
+    inc[[paste0("pc", lv)]] <- derive_cbs_features(t)[, c("postcode", "income_eur")]
+  }
+  vals <- c(inc$pc5$income_eur, inc$pc4$income_eur)
+  vals <- vals[!is.na(vals)]
+  moments <- c(mean = mean(vals), sd = sd(vals), n = length(vals))
+  say("  income moments (PC5+PC4 pooled): mean = %.0f EUR, SD = %.0f EUR, n = %d postcodes",
+      moments["mean"], moments["sd"], moments["n"])
+  z <- function(e) (e - moments["mean"]) / moments["sd"]
+  inc$pc5$income_z <- z(inc$pc5$income_eur)
+  inc$pc4$income_z <- z(inc$pc4$income_eur)
+
+  keep <- c("postcode", "female_share", "avg_age", "huishoudgrootte", "rental_share", "woz_eur", "urban")
+  out <- list(
+    pc6 = tabs$pc6[, intersect(keep, names(tabs$pc6))],
+    pc5 = tabs$pc5[, intersect(keep, names(tabs$pc5))] %>% left_join(inc$pc5, by = "postcode"),
+    pc4 = tabs$pc4[, intersect(keep, names(tabs$pc4))] %>% left_join(inc$pc4, by = "postcode"))
+  attr(out, "income_moments") <- moments
+  attr(out, "sources") <- c(pc6 = find_cbs_file(data_dir, 6, cbs_year), pc5 = find_cbs_file(data_dir, 5, cbs_year),
+                            pc4 = find_cbs_file(data_dir, 4, cbs_year),
+                            income_pc5 = find_cbs_file(data_dir, 5, income_year), income_pc4 = find_cbs_file(data_dir, 4, income_year))
+  out
+}
+
+# ---- BAG (building registry) ---------------------------------------------------
+
+# Extract the verblijfsobject layer of bag-light.gpkg (PDOK) without geometry.
+# Returns one row per verblijfsobject with clean 16-digit IDs.
+build_bag_table <- function(gpkg, layer = "verblijfsobject") {
+  if (!requireNamespace("sf", quietly = TRUE)) stop("Package 'sf' is needed to read the BAG geopackage: install.packages('sf')", call. = FALSE)
+  if (!file.exists(gpkg)) {
+    stop(sprintf(paste(
+      "BAG geopackage not found: %s",
+      "Download bag-light.gpkg from the PDOK BAG Atom feed (https://service.pdok.nl/lv/bag/atom/bag.xml,",
+      "direct link https://service.pdok.nl/lv/bag/atom/downloads/bag-light.gpkg, several GB) and set bag_gpkg to its path."),
+      gpkg), call. = FALSE)
+  }
+  say("BAG: reading layer '%s' from %s (this is the slow step, a few minutes)", layer, basename(gpkg))
+  probe <- suppressWarnings(sf::st_read(gpkg, query = sprintf('SELECT * FROM "%s" LIMIT 1', layer), quiet = TRUE))
+  cols  <- setdiff(names(probe), attr(probe, "sf_column"))
+
+  need <- c(identificatie = "verblijfsobject_id",
+            nummeraanduiding_hoofdadres_identificatie = "bag_id",
+            oppervlakte = "oppervlakte_m2",
+            bouwjaar = "bouwjaar")
+  opt  <- c(postcode = "postcode", huisnummer = "huisnummer", huisletter = "huisletter",
+            huisnummertoevoeging = "toevoeging", toevoeging = "toevoeging",
+            openbare_ruimte_naam = "straat", woonplaats_naam = "woonplaats",
+            pand_identificatie = "pand_id", gebruiksdoel = "gebruiksdoel")
+  miss <- setdiff(names(need), cols)
+  if (length(miss) > 0) {
+    stop(sprintf("Layer '%s' lacks column(s) %s. Columns present: %s. Edit 'need' in build_bag_table().",
+                 layer, paste(miss, collapse = ", "), paste(cols, collapse = ", ")), call. = FALSE)
+  }
+  sel <- c(need, opt[names(opt) %in% cols])
+  sel <- sel[!duplicated(unname(sel))]
+  q   <- sprintf('SELECT %s FROM "%s"',
+                 paste(sprintf('"%s" AS %s', names(sel), unname(sel)), collapse = ", "), layer)
+  bag <- suppressWarnings(sf::st_read(gpkg, query = q, quiet = TRUE))
+  if (inherits(bag, "sf")) bag <- sf::st_drop_geometry(bag)
+  bag <- as_tibble(bag)
+
+  bag$bag_id             <- as.character(normalise_bag_id(bag$bag_id))
+  bag$verblijfsobject_id <- as.character(normalise_bag_id(bag$verblijfsobject_id))
+  bag$oppervlakte_m2 <- suppressWarnings(as.numeric(bag$oppervlakte_m2))
+  bag$oppervlakte_m2[!is.na(bag$oppervlakte_m2) &
+                       (bag$oppervlakte_m2 < BAG_AREA_RANGE[1] | bag$oppervlakte_m2 > BAG_AREA_RANGE[2])] <- NA
+  bag$bouwjaar <- suppressWarnings(as.integer(bag$bouwjaar))
+  bag$bouwjaar[!is.na(bag$bouwjaar) & (bag$bouwjaar < BAG_YEAR_RANGE[1] | bag$bouwjaar > BAG_YEAR_RANGE[2])] <- NA
+  if (all(c("postcode", "huisnummer") %in% names(bag))) {
+    bag$address_key <- address_key(bag$postcode, bag$huisnummer,
+                                   bag$huisletter %||% "", bag$toevoeging %||% "")
+  }
+  say("  %s verblijfsobjecten; %.1f%% with usable floor area, %.1f%% with usable construction year",
+      format(nrow(bag), big.mark = ","), 100 * mean(!is.na(bag$oppervlakte_m2)), 100 * mean(!is.na(bag$bouwjaar)))
+  bag
+}
+
+# ---- cache: write once, read every time --------------------------------------
+
+cache_paths <- function(cache_dir, cbs_year) {
+  list(pc6 = file.path(cache_dir, sprintf("cbs_pc6_%d.csv", cbs_year)),
+       pc5 = file.path(cache_dir, sprintf("cbs_pc5_%d.csv", cbs_year)),
+       pc4 = file.path(cache_dir, sprintf("cbs_pc4_%d.csv", cbs_year)),
+       bag = file.path(cache_dir, "bag_verblijfsobjecten.csv"),
+       meta = file.path(cache_dir, sprintf("open_data_meta_%d.csv", cbs_year)))
+}
+
+write_open_data_cache <- function(open_data, cache_dir, cbs_year) {
+  dir.create(cache_dir, showWarnings = FALSE, recursive = TRUE)
+  p <- cache_paths(cache_dir, cbs_year)
+  for (lv in c("pc6", "pc5", "pc4")) fwrite(open_data$cbs[[lv]], p[[lv]])
+  fwrite(open_data$bag, p$bag)
+  fwrite(open_data$meta, p$meta)
+  say("Cache written to %s", cache_dir)
+  invisible(p)
+}
+
+read_open_data_cache <- function(cache_dir, cbs_year) {
+  p <- cache_paths(cache_dir, cbs_year)
+  rd <- function(f, char_cols) {
+    hdr <- names(fread(f, nrows = 0))
+    cc  <- intersect(char_cols, hdr)
+    as_tibble(fread(f, colClasses = if (length(cc)) list(character = cc) else NULL, na.strings = c("", "NA")))
+  }
+  cbs <- list(pc6 = rd(p$pc6, "postcode"), pc5 = rd(p$pc5, "postcode"), pc4 = rd(p$pc4, "postcode"))
+  bag <- rd(p$bag, c("bag_id", "verblijfsobject_id", "pand_id", "postcode", "huisletter",
+                     "toevoeging", "straat", "woonplaats", "gebruiksdoel", "address_key"))
+  meta <- rd(p$meta, c("key", "value"))
+  list(cbs = cbs, bag = bag, meta = meta)
+}
+
+open_data_cache_exists <- function(cache_dir, cbs_year) all(file.exists(unlist(cache_paths(cache_dir, cbs_year))))
+
+meta_value <- function(open_data, key) {
+  v <- open_data$meta$value[open_data$meta$key == key]
+  if (length(v) == 0) NA else v[1]
+}
+
+# One entry point for everything: returns the cache, building it if needed.
+get_open_data <- function(data_dir, cbs_year, income_year = cbs_year - 1,
+                          cache_dir = file.path(data_dir, "cache"),
+                          bag_gpkg = file.path(data_dir, "bag-light.gpkg"), rebuild = FALSE) {
+  if (!rebuild && open_data_cache_exists(cache_dir, cbs_year)) {
+    say("Open-data cache found in %s (CBS %d). Reading it; set rebuild = TRUE to rebuild.", cache_dir, cbs_year)
+    return(read_open_data_cache(cache_dir, cbs_year))
+  }
+  say("Building the open-data cache (one-off).")
+  cbs <- build_cbs_tables(data_dir, cbs_year, income_year)
+  bag_path <- cache_paths(cache_dir, cbs_year)$bag
+  bag <- if (!rebuild && file.exists(bag_path)) {
+    say("BAG cache %s already exists; reusing it.", basename(bag_path))
+    read_open_data_cache_bag(bag_path)
+  } else build_bag_table(bag_gpkg)
+
+  # Population-level fall-backs used when an address has no data at any level.
+  yb_idx <- findInterval(bag$bouwjaar, YEAR_BUILT_BREAKS) + 1
+  yb_mode <- names(which.max(table(yb_idx)))
+  mom <- attr(cbs, "income_moments")
+  meta <- tibble(key = c("cbs_year", "income_year", "built_on", "income_mean_eur", "income_sd_eur", "income_n_postcodes",
+                         "default_female_share", "default_avg_age", "default_huishoudgrootte", "default_rental_share",
+                         "default_urban", "default_income_z", "default_square_meters", "default_year_built_index",
+                         paste0("source_", names(attr(cbs, "sources")))),
+                 value = as.character(c(cbs_year, income_year, format(Sys.time(), "%Y-%m-%d %H:%M"),
+                                        mom["mean"], mom["sd"], mom["n"],
+                                        median(cbs$pc4$female_share, na.rm = TRUE), median(cbs$pc4$avg_age, na.rm = TRUE),
+                                        median(cbs$pc4$huishoudgrootte, na.rm = TRUE), median(cbs$pc4$rental_share, na.rm = TRUE),
+                                        median(cbs$pc4$urban, na.rm = TRUE), 0,
+                                        median(bag$oppervlakte_m2, na.rm = TRUE), yb_mode,
+                                        attr(cbs, "sources"))))
+  open_data <- list(cbs = cbs[c("pc6", "pc5", "pc4")], bag = bag, meta = meta)
+  write_open_data_cache(open_data, cache_dir, cbs_year)
+  open_data
+}
+
+read_open_data_cache_bag <- function(bag_path) {
+  hdr <- names(fread(bag_path, nrows = 0))
+  cc  <- intersect(c("bag_id", "verblijfsobject_id", "pand_id", "postcode", "huisletter", "toevoeging",
+                     "straat", "woonplaats", "gebruiksdoel", "address_key"), hdr)
+  as_tibble(fread(bag_path, colClasses = list(character = cc), na.strings = c("", "NA")))
+}
+
+print_open_data_summary <- function(open_data) {
+  cov <- function(t, v) if (v %in% names(t)) sprintf("%s %.0f%%", v, 100 * mean(!is.na(t[[v]]))) else NULL
+  say("\nOpen data (CBS %s, income %s, built %s)", meta_value(open_data, "cbs_year"),
+      meta_value(open_data, "income_year"), meta_value(open_data, "built_on"))
+  for (lv in c("pc6", "pc5", "pc4")) {
+    t <- open_data$cbs[[lv]]
+    say("  %s: %s postcodes | coverage: %s", toupper(lv), format(nrow(t), big.mark = ","),
+        paste(unlist(lapply(c("female_share", "avg_age", "huishoudgrootte", "rental_share", "income_z", "urban"),
+                            function(v) cov(t, v))), collapse = ", "))
+  }
+  say("  BAG: %s verblijfsobjecten, address matching %s",
+      format(nrow(open_data$bag), big.mark = ","),
+      if ("address_key" %in% names(open_data$bag)) "available" else "not available (no address columns in the layer)")
+  say("  income moments: mean %s EUR, SD %s EUR",
+      format(round(as.numeric(meta_value(open_data, "income_mean_eur"))), big.mark = ","),
+      format(round(as.numeric(meta_value(open_data, "income_sd_eur"))), big.mark = ","))
+}
+
+# ---- address lists ----------------------------------------------------------
+
+# Read a CSV or Excel address list with every column as text (so BAG IDs and
+# postcodes are never mangled). Returns the sheet exactly as it is.
+read_address_file <- function(path, sheet = NULL, skip = 0) {
+  if (!file.exists(path)) stop("Address file not found: ", path, call. = FALSE)
+  ext <- tolower(tools::file_ext(path))
+  if (ext %in% c("xlsx", "xls")) {
+    suppressMessages(read_excel(path, sheet = sheet %||% 1, skip = skip, col_types = "text"))
+  } else if (ext %in% c("csv", "txt")) {
+    suppressMessages(read_delim(path, delim = NULL, skip = skip, col_types = cols(.default = col_character()), show_col_types = FALSE))
+  } else stop("Address file must be .csv, .xlsx or .xls: ", path, call. = FALSE)
+}
+
+# Find the columns we need in whatever the batch calls them. col_map can force
+# any of: bag_id, postcode, huisnummer, huisletter, toevoeging.
+standardise_addresses <- function(df, col_map = list()) {
+  find_col <- function(key, pattern) {
+    if (!is.null(col_map[[key]])) {
+      if (!col_map[[key]] %in% names(df)) stop(sprintf("Column '%s' (col_map$%s) not in the address file.", col_map[[key]], key), call. = FALSE)
+      return(col_map[[key]])
+    }
+    hits <- names(df)[grepl(pattern, names(df), ignore.case = TRUE)]
+    if (length(hits) == 0) return(NULL)
+    hits[1]
+  }
+  c_bag <- find_col("bag_id", "bag|nummeraanduiding|adresseerbaar")
+  c_pc  <- find_col("postcode", "postcode|^pc6?$")
+  c_hn  <- find_col("huisnummer", "huisnummer|house|^nr\\.?$|^number$")
+  c_hl  <- find_col("huisletter", "huisletter")
+  c_tv  <- find_col("toevoeging", "toevoeging")
+  if (is.null(c_pc)) stop("No postcode column found in the address file. Columns: ", paste(names(df), collapse = ", "), call. = FALSE)
+  if (is.null(c_bag)) say("note: no BAG ID column found; addresses will be matched to the BAG on postcode + house number only.")
+  say("Address columns: bag_id = %s, postcode = %s, huisnummer = %s%s%s",
+      c_bag %||% "(none)", c_pc, c_hn %||% "(none)",
+      if (!is.null(c_hl)) paste0(", huisletter = ", c_hl) else "",
+      if (!is.null(c_tv)) paste0(", toevoeging = ", c_tv) else "")
+
+  bag_raw <- if (!is.null(c_bag)) as.character(df[[c_bag]]) else rep(NA_character_, nrow(df))
+  bag_id  <- normalise_bag_id(bag_raw)
+  bag_status <- attr(bag_id, "status")    # read the attribute before tibble() strips it
+  hn      <- if (!is.null(c_hn)) parse_huisnummer(df[[c_hn]]) else tibble(huisnummer = NA_integer_, huisletter = "", toevoeging = "")[rep(1, nrow(df)), ]
+  if (!is.null(c_hl)) hn$huisletter <- ifelse(is.na(df[[c_hl]]) | df[[c_hl]] == "", hn$huisletter, tolower(trimws(df[[c_hl]])))
+  if (!is.null(c_tv)) hn$toevoeging <- ifelse(is.na(df[[c_tv]]) | df[[c_tv]] == "", hn$toevoeging, tolower(gsub("[^A-Za-z0-9]", "", df[[c_tv]])))
+
+  work <- tibble(
+    .row_id       = seq_len(nrow(df)),
+    bag_id_raw    = bag_raw,
+    bag_id        = as.character(bag_id),
+    bag_id_status = bag_status,
+    bag_id_kind   = bag_id_type(as.character(bag_id)),
+    postcode_raw  = as.character(df[[c_pc]]),
+    postcode      = normalise_postcode(df[[c_pc]]),
+    huisnummer_raw = if (!is.null(c_hn)) as.character(df[[c_hn]]) else NA_character_,
+    huisnummer    = hn$huisnummer,
+    huisletter    = hn$huisletter,
+    toevoeging    = hn$toevoeging)
+  work$postcode_valid <- is_valid_pc6(work$postcode)
+  work$address_key    <- address_key(work$postcode, work$huisnummer, work$huisletter, work$toevoeging)
+
+  say("BAG ID check: %s", paste(sprintf("%s = %d", names(table(work$bag_id_status)), as.integer(table(work$bag_id_status))), collapse = "; "))
+  if (any(!work$postcode_valid)) say("Invalid postcodes: %d row(s) (they get PC4/national fall-backs only).", sum(!work$postcode_valid))
+  work
+}
+
+# ---- feature assembly ---------------------------------------------------------
+
+# Attach BAG building characteristics. Matching order:
+#   1. nummeraanduiding ID  2. verblijfsobject ID  3. postcode + house number
+join_bag <- function(work, bag) {
+  bag_cols <- intersect(c("oppervlakte_m2", "bouwjaar", "verblijfsobject_id", "gebruiksdoel"), names(bag))
+  out <- work %>% mutate(bag_match = "none", oppervlakte_m2 = NA_real_, bouwjaar = NA_integer_,
+                         bag_verblijfsobject_id = NA_character_)
+  take <- function(out, key_work, key_bag, label) {
+    todo <- which(out$bag_match == "none" & !is.na(out[[key_work]]))
+    if (length(todo) == 0) return(out)
+    ref <- bag[!is.na(bag[[key_bag]]), ] %>% distinct(.data[[key_bag]], .keep_all = TRUE)
+    m <- match(out[[key_work]][todo], ref[[key_bag]])
+    hit <- !is.na(m)
+    if (any(hit)) {
+      rows <- todo[hit]
+      out$oppervlakte_m2[rows] <- ref$oppervlakte_m2[m[hit]]
+      out$bouwjaar[rows]       <- ref$bouwjaar[m[hit]]
+      out$bag_verblijfsobject_id[rows] <- ref$verblijfsobject_id[m[hit]]
+      out$bag_match[rows] <- label
+    }
+    out
+  }
+  out <- out %>% mutate(.key_na = ifelse(bag_id_kind == "nummeraanduiding", bag_id, NA_character_),
+                        .key_vo = ifelse(bag_id_kind == "verblijfsobject", bag_id, NA_character_))
+  out <- take(out, ".key_na", "bag_id", "nummeraanduiding")
+  out <- take(out, ".key_vo", "verblijfsobject_id", "verblijfsobject")
+  if ("address_key" %in% names(bag)) out <- take(out, "address_key", "address_key", "address")
+  out %>% select(-.key_na, -.key_vo)
+}
+
+# Attach CBS postcode statistics with PC6 -> PC5 -> PC4 fall-back per variable.
+join_cbs <- function(work, cbs) {
+  vars <- c("female_share", "avg_age", "huishoudgrootte", "rental_share", "income_z", "urban", "woz_eur")
+  x <- work %>% mutate(.pc5 = substr(postcode, 1, 5), .pc4 = substr(postcode, 1, 4))
+  for (lv in c("pc6", "pc5", "pc4")) {
+    t <- cbs[[lv]]
+    t <- t[, intersect(c("postcode", vars), names(t))]
+    names(t)[-1] <- paste0(names(t)[-1], "__", lv)
+    by <- c(pc6 = "postcode", pc5 = ".pc5", pc4 = ".pc4")[[lv]]
+    x <- left_join(x, t, by = setNames("postcode", by))
+  }
+  fallback_notes <- rep("", nrow(x))
+  for (v in vars) {
+    cols <- paste0(v, "__", c("pc6", "pc5", "pc4"))
+    cols <- cols[cols %in% names(x)]
+    if (length(cols) == 0) next
+    vals <- as.data.frame(x[cols])
+    lvl  <- apply(vals, 1, function(r) { i <- which(!is.na(r)); if (length(i)) sub(".*__", "", cols[i[1]]) else NA })
+    x[[v]] <- do.call(coalesce, unname(as.list(vals)))
+    finest <- sub(".*__", "", cols[1])
+    used_coarser <- !is.na(lvl) & lvl != finest
+    fallback_notes[used_coarser] <- paste0(fallback_notes[used_coarser], v, "<-", lvl[used_coarser], "; ")
+    x[[paste0(v, "__level")]] <- lvl
+  }
+  x$cbs_fallback <- sub("; $", "", fallback_notes)
+  x %>% select(-all_of(grep("__pc[456]$", names(x), value = TRUE)), -.pc5, -.pc4)
+}
+
+# Everything together: BAG + CBS -> the eight model features, with imputation
+# flags for rows that had no data at any level (so prediction never crashes and
+# nothing is filled silently).
+assemble_features <- function(work, open_data, bundle) {
+  x <- work %>% join_bag(open_data$bag) %>% join_cbs(open_data$cbs)
+
+  yb_levels <- bundle$year_built_levels
+  yb_breaks <- bundle$year_built_breaks
+  x$year_built <- ifelse(is.na(x$bouwjaar), NA_character_, yb_levels[findInterval(x$bouwjaar, yb_breaks) + 1])
+
+  x <- x %>% mutate(female = female_share, age = avg_age, members = huishoudgrootte,
+                    rental = rental_share, nettohh_z = income_z, square_meters = oppervlakte_m2)
+
+  # Fall-backs: population medians from the open data of the year used; the
+  # training medians in the bundle are the last resort.
+  dflt <- list(
+    female        = as.numeric(meta_value(open_data, "default_female_share")),
+    age           = as.numeric(meta_value(open_data, "default_avg_age")),
+    members       = as.numeric(meta_value(open_data, "default_huishoudgrootte")),
+    rental        = as.numeric(meta_value(open_data, "default_rental_share")),
+    urban         = as.numeric(meta_value(open_data, "default_urban")),
+    nettohh_z     = 0,
+    square_meters = as.numeric(meta_value(open_data, "default_square_meters")),
+    year_built    = yb_levels[as.integer(meta_value(open_data, "default_year_built_index"))])
+  for (f in names(dflt)) if (is.na(dflt[[f]]) || length(dflt[[f]]) == 0) dflt[[f]] <- bundle$training$feature_defaults[[f]]
+
+  imputed <- rep("", nrow(x))
+  for (f in bundle$features) {
+    miss <- is.na(x[[f]])
+    if (any(miss)) {
+      x[[f]][miss] <- dflt[[f]]
+      imputed[miss] <- paste0(imputed[miss], f, "; ")
+    }
+  }
+  x$imputed_features <- sub("; $", "", imputed)
+
+  say("\nFeature assembly: %d addresses", nrow(x))
+  say("  BAG match: %s", paste(sprintf("%s = %d", names(table(x$bag_match)), as.integer(table(x$bag_match))), collapse = "; "))
+  say("  CBS: %d with PC6 demographics, %d needed a coarser level, %d with postcode income",
+      sum(x$female_share__level == "pc6", na.rm = TRUE), sum(x$cbs_fallback != ""), sum(!is.na(x$income_z)))
+  say("  Imputed with population fall-backs: %d row(s)%s", sum(x$imputed_features != ""),
+      if (any(x$imputed_features != "")) paste0(" (", paste(names(sort(table(unlist(strsplit(x$imputed_features[x$imputed_features != ""], "; "))), decreasing = TRUE)), collapse = ", "), ")") else "")
+  x
+}
+
+# ---- model bundle -------------------------------------------------------------
+
+read_model_bundle <- function(path) {
+  if (!file.exists(path)) stop("Model file not found: ", path, "\nIt is models/persona_rf.rds in the repository; check repo_dir / model_path in the config chunk.", call. = FALSE)
+  b <- readRDS(path)
+  stopifnot(is.list(b), inherits(b$forest, "ranger"))
+  if (!requireNamespace("ranger", quietly = TRUE)) stop("Package 'ranger' is needed: install.packages('ranger')", call. = FALSE)
+  rv <- as.character(packageVersion("ranger"))
+  if (!identical(rv, b$training$ranger_version)) {
+    say("note: model trained with ranger %s, you have %s. Predictions are normally unaffected.", b$training$ranger_version, rv)
+  }
+  b
+}
+
+# Score assembled features. Returns the four-class prediction (the model's
+# target) and the deployed persona after the Erratic -> Comfort fold.
+predict_personas <- function(bundle, features) {
+  X <- as.data.frame(features[bundle$features])
+  X$year_built <- factor(as.character(X$year_built), levels = bundle$year_built_levels)
+  for (v in setdiff(bundle$features, "year_built")) X[[v]] <- as.numeric(X[[v]])
+  na_cols <- names(X)[colSums(is.na(X)) > 0]
+  if (length(na_cols) > 0) stop("Missing values in model features: ", paste(na_cols, collapse = ", "),
+                                ". Run assemble_features() first (it fills them and records what it filled).", call. = FALSE)
+  p <- predict(bundle$forest, data = X)$predictions
+  class4 <- as.character(p)
+  folded <- ifelse(class4 %in% names(bundle$fold_rule), unname(bundle$fold_rule[class4]), class4)
+  tibble(persona_class4 = class4,
+         persona_class4_label = unname(bundle$class_labels[class4]),
+         persona = folded,
+         persona_label = unname(bundle$class_labels[folded]))
+}
+
+print_model_card <- function(bundle) {
+  t <- bundle$training
+  say("\n==== Persona random forest (model card) ====")
+  say("trained %s | n = %d | %d trees | ranger %s", t$date, t$n_obs, t$num_trees, t$ranger_version)
+  say("tuning (%s, CV): %s", t$cv_metric, paste(sprintf("%s = %s", names(t$tuning), vapply(t$tuning, as.character, "")), collapse = ", "))
+  say("class weights: %s", paste(sprintf("%s = %.2f", names(t$class_weights), t$class_weights), collapse = ", "))
+  say("OOB error (four-class, before the Erratic -> Comfort fold): %.3f", t$oob_error)
+  say("OOB confusion (rows = true, cols = predicted):")
+  print(t$oob_confusion)
+  cat("\nper class: ")
+  print(round(rbind(recall = t$oob_recall, precision = t$oob_precision, lift = t$oob_lift), 3))
+  cat("\nOOB confusion after folding predicted Erratic into Comfort (deployment view):\n")
+  print(t$oob_confusion_folded)
+  cat("\npermutation importance:\n")
+  print(round(t$importance, 4))
+  say("deployment rule: %s", paste(sprintf("%s -> %s", names(bundle$fold_rule), bundle$fold_rule), collapse = ", "))
+  say("features: %s", paste(bundle$features, collapse = ", "))
+  say("=============================================\n")
+}
+```
+
+# Step 1: Open data (built once, then read from the cache)
+
+```{r open-data}
+open_data <- get_open_data(data_dir = path.expand(data_dir), cbs_year = cbs_year, income_year = income_year,
+                           cache_dir = path.expand(cache_dir), bag_gpkg = path.expand(bag_gpkg),
+                           rebuild = rebuild_cache)
+print_open_data_summary(open_data)
+```
+
+# Step 2: The trained model
+
+```{r model}
+bundle <- read_model_bundle(model_path)
+print_model_card(bundle)
+```
+
+# Step 3: Your addresses
+
+```{r addresses}
+addresses_original <- if (is.data.frame(addresses)) {
+  as_tibble(addresses) %>% mutate(across(everything(), as.character))
+} else read_address_file(from_repo(addresses), addresses_sheet, addresses_skip)
+
+cat(nrow(addresses_original), "addresses; columns:", paste(names(addresses_original), collapse = " | "), "\n")
+
+# Working copy with clean keys; the original is written back untouched in Step 5.
+work <- standardise_addresses(addresses_original, address_col_map)
+```
+
+```{r assemble}
+features <- assemble_features(work, open_data, bundle)
+
+# Addresses that needed any fall-back, for the record
+features %>%
+  filter(bag_match != "nummeraanduiding" | cbs_fallback != "" | imputed_features != "") %>%
+  count(bag_match, cbs_fallback, imputed_features, name = "addresses") %>%
+  arrange(-addresses)
+```
+
+# Step 4: Predict
+
+```{r predict}
+pred <- predict_personas(bundle, features)
+scored <- bind_cols(features, pred)
+
+table(scored$persona_class4_label)     # the forest's four classes
+table(scored$persona_label)            # after Erratic -> Comfort
+
+ggplot(scored, aes(x = persona_label)) +
+  geom_bar(fill = "steelblue") +
+  labs(title = "Predicted persona distribution", x = "Persona", y = "Addresses") +
+  theme_minimal()
+```
+
+# Step 5: Write the output
+
+Your columns exactly as they were, followed by the model's columns. If one of
+the appended names already exists in your file, the appended copy gets `_model`.
+
+```{r write-output}
+extra <- scored %>%
+  select(bag_id_clean = bag_id, bag_id_status, bag_match, oppervlakte_m2, bouwjaar, year_built,
+         female, age, members, rental, urban, nettohh_z, square_meters,
+         cbs_fallback, imputed_features,
+         persona_class4, persona_class4_label, persona, persona_label)
+clash <- names(extra) %in% names(addresses_original)
+names(extra)[clash] <- paste0(names(extra)[clash], "_model")
+out <- bind_cols(addresses_original, extra)
+stopifnot(nrow(out) == nrow(addresses_original))
+
+path_output_csv <- from_repo(path_output_csv)
+dir.create(dirname(path_output_csv), showWarnings = FALSE, recursive = TRUE)
+write_csv(out, path_output_csv, na = "")
+cat("Wrote", path_output_csv, "\n")
+
+if (!is.null(path_output_xlsx)) {
+  path_output_xlsx <- from_repo(path_output_xlsx)
+  dir.create(dirname(path_output_xlsx), showWarnings = FALSE, recursive = TRUE)
+  write_xlsx(list("Personas" = out), path_output_xlsx)
+  cat("Wrote", path_output_xlsx, "\n")
+}
+
+cat("\nPersonas (after Erratic -> Comfort):\n")
+print(table(out$persona_label, useNA = "ifany"))
+```
