@@ -11,7 +11,7 @@ Three independent Docker-packaged models for Dutch household energy analysis.
 ## Models
 
 ### 1. [persona-segmentation](persona-segmentation/)
-Consumer persona prediction using Random Forest ML. Classifies Dutch addresses into four behavioral types based on demographics and housing data.
+Consumer persona prediction using Random Forest ML. Classifies Dutch addresses into four behavioral types from CBS postcode statistics and BAG building data, with a model trained on LISS panel data.
 
 ### 2. [profile-generator](profile-generator/)
 PyTorch-based neural network for generating synthetic daily energy consumption profiles. Generates annual profiles (12 months × 96 intervals per day) based on household characteristics and technology adoption.

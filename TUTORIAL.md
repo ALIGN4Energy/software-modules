@@ -30,6 +30,8 @@ The persona segmentation model predicts which of four behavioral consumer types 
 - **Class 3 - Erratic choosers** (~13.1%): Inconsistent decision patterns
 - **Class 4 - Comfort driven** (~56.7%): Prioritize comfort and convenience over cost
 
+The model uses CBS postcode statistics and BAG building data for each address. Treat the prediction as a prior, not a diagnosis: the model is only slightly better than chance (see the model card in [persona-segmentation/README.md](persona-segmentation/README.md#model-card)).
+
 ### Running with Docker
 
 ```bash
@@ -38,50 +40,57 @@ cd persona-segmentation
 # Build the Docker image
 docker build -t persona-segmentation .
 
-# Run with example postcodes
-docker run --rm -v $(pwd)/output:/app/output persona-segmentation 1011AB 2514JG 20 9
+# Download the open data once (about 8 GB, kept in the Docker volume "persona-data")
+docker run --rm -v persona-data:/data persona-segmentation download
+
+# Predict for postcode + house number pairs
+docker run --rm -v persona-data:/data -v $(pwd)/output:/app/output persona-segmentation 1011AB 12 2514JG 20
 
 # View results
-cat output/user_predictions.csv
+cat output/persona_predictions.csv
 ```
+
+The first prediction builds a cache from the BAG data. This takes up to 30 minutes and needs about 13 GB of memory, so give Docker at least 16 GB. Later runs take one to two minutes.
 
 ### Input Format
 
-The model accepts Dutch postcodes and house numbers as command-line arguments:
+Give postcode and house number pairs on the command line, or an address file (CSV or XLSX with columns `postcode`, `huisnummer` and optionally `bag_id`):
 
 ```bash
-# Format: "POSTCODE" "POSTCODE" "HOUSE_NUMBER" "HOUSE_NUMBER"
-docker run --rm -v $(pwd)/output:/app/output persona-segmentation 1012AB 3521CV 25 10B
+docker run --rm -v persona-data:/data -v $(pwd)/output:/app/output \
+  -v $(pwd)/addresses.csv:/app/input.csv persona-segmentation /app/input.csv
 ```
+
+See `persona-segmentation/examples/addresses_example.csv` for the file format.
 
 ### Output Format
 
-The model generates `output/user_predictions.csv` with the following columns:
+The model writes `output/persona_predictions.csv` and `output/persona_predictions.xlsx`: your input columns, followed by
 
 | Column | Description |
 |--------|-------------|
-| `bag_id` | Internal identifier (USER_postcode_number) |
-| `Postcode` | Input postcode |
-| `Huisnummer` | Input house number |
-| `female` | Regional female proportion used for prediction |
-| `age` | Regional average age used for prediction |
-| `members` | Regional average household size used for prediction |
-| `rental` | Regional rental proportion used for prediction |
-| `urban` | Regional urbanization level (1-5) used for prediction |
-| `nettohh_z` | Regional income z-score used for prediction |
-| `year_built` | Building construction period (default or from BAG data) |
-| `square_meters` | Building size in square meters (default or from BAG data) |
-| `predicted_persona` | Predicted consumer persona class (Class1-Class4) |
+| `bag_id_clean`, `bag_id_status` | Repaired 16-digit BAG ID and what was done to it |
+| `bag_match` | How the address was matched to the BAG (`nummeraanduiding`, `verblijfsobject`, `address` or `none`) |
+| `oppervlakte_m2`, `bouwjaar`, `year_built` | Floor area, construction year and its category |
+| `female`, `age`, `members`, `rental`, `urban`, `nettohh_z`, `square_meters` | Model features, from CBS postcode statistics and the BAG |
+| `cbs_fallback` | CBS variables taken from PC5 or PC4 because the PC6 value is suppressed |
+| `imputed_features` | Features filled with population averages because no data was found |
+| `persona_class4`, `persona_class4_label` | The model's four-class prediction |
+| `persona`, `persona_label` | The persona to use, with Erratic folded into Comfort |
 
 ### Example Output
 
+Selected columns for `examples/addresses_example.csv` (four city halls):
+
 ```csv
-bag_id,Postcode,Huisnummer,female,age,members,rental,urban,nettohh_z,year_built,square_meters,predicted_persona
-USER_1011AB_12,1011AB,12,0.52,36,1.9,0.65,5,0.3,Tussen 1971 en 2000,80,Class4
-USER_2514JG_5A,2514JG,5A,0.51,40,2.2,0.35,4,0.1,Tussen 1971 en 2000,80,Class2
+postcode,huisnummer,bag_match,year_built,rental,urban,nettohh_z,persona_class4_label,persona_label
+1011PN,1,nummeraanduiding,Tussen 1971 en 2000,0.80,1,-0.14,Comfort,Comfort
+2511BT,70,nummeraanduiding,Tussen 1971 en 2000,1.00,1,-0.26,Policy,Policy
+3011AD,40,address,Vóór 1940,0.90,1,-1.07,Policy,Policy
+3521AZ,1,nummeraanduiding,In 2001 of later,0.80,1,0.59,Financially,Financially
 ```
 
-**Note**: The output includes all demographic and housing characteristics used to generate the prediction, allowing you to understand what regional averages were applied for each address.
+City halls have no residents in their own PC6 postcode, so the CBS values come from PC5 (`cbs_fallback`). Their office floor areas are outside the residential range, so `square_meters` is a population fall-back (`imputed_features`).
 
 ## Part 2: Profile Generator
 

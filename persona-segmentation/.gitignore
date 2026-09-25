@@ -24,9 +24,11 @@ cbs_postcode_data/
 *.csv
 *.xlsx
 *.xls
+!examples/*.csv
 
-# Model outputs
+# Model outputs (the shipped model is the exception)
 *.rds
+!models/persona_rf.rds
 predicted_personas.csv
 user_predictions_*.csv
 user_address_predictions.csv
@@ -50,6 +52,7 @@ __pycache__/
 
 # Output directories
 output/
+data/
 results/
 
 # Lock files
